@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply font-sans antialiased bg-warmbeige-50 text-neutral-900;
+  }
+}
+
+/* Custom scrollbar matching the premium warm-beige & terracotta aesthetic */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #E8DEC9;
+  border-radius: 8px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #C46A3D;
+}
+
+/* Premium micro-interactions & glassmorphism utilities */
+.glass-panel {
+  background: rgba(255, 255, 255, 0.75);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.5);
+}
+
+.glass-panel-warm {
+  background: rgba(249, 246, 240, 0.85);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(232, 222, 201, 0.4);
+}
+
+/* Pulse Glow effect for AI elements */
+@keyframes ai-pulse {
+  0%, 100% {
+    box-shadow: 0 0 15px rgba(196, 106, 61, 0.1);
+    border-color: rgba(196, 106, 61, 0.2);
+  }
+  50% {
+    box-shadow: 0 0 25px rgba(196, 106, 61, 0.25);
+    border-color: rgba(196, 106, 61, 0.5);
+  }
+}
+
+.ai-border-glow {
+  animation: ai-pulse 3s infinite ease-in-out;
+}
