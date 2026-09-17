@@ -1,0 +1,29 @@
+﻿node.exe : NotFound: FileSystem.readFile (C:\Users\yagni yeruva\.supabase\profile)
+At line:1 char:1
++ & "C:\Program Files\nodejs/node.exe" "C:\Program Files\nodejs/node_mo ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (NotFound: FileS...pabase\profile):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Using access token for profile: supabase
+Supabase CLI 2.114.0
+Using profile: supabase (supabase.co)
+Using access token for profile: supabase
+Initialising login role...
+2026/09/16 10:59:37 HTTP POST: https://api.supabase.com/v1/projects/nguobxdfugwolauarqjd/cli/login-role
+Using access token for profile: supabase
+2026/09/16 10:59:39 HTTP POST: https://api.supabase.com/v1/projects/nguobxdfugwolauarqjd/database/query
+[
+  {
+    "count": 82,
+    "role": "CONTRACTOR"
+  },
+  {
+    "count": 136,
+    "role": "CUSTOMER"
+  },
+  {
+    "count": 2,
+    "role": "ADMIN"
+  }
+]

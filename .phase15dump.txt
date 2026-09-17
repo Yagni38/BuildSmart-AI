@@ -1,0 +1,1482 @@
+===== src/types/auth.ts =====
+1: /**
+2:  * Authentication-related types for the BuildSmart AI Supabase auth integration.
+3:  *
+4:  * UserRole and Profile are the single source of truth used across the app.
+5:  * They are re-exported from ./index so legacy `../types` imports keep working.
+6:  */
+7: import type { User, Session } from '@supabase/supabase-js';
+8: 
+9: // ============================================================
+10: // UserRole
+11: // ============================================================
+12: export type UserRole = 'CUSTOMER' | 'CONTRACTOR' | 'ADMIN';
+13: 
+14: // ============================================================
+15: // Profile (mirrors the public.profiles table)
+16: // ============================================================
+17: export interface Profile {
+18:   id: string; // UUID — references auth.users.id
+19:   email: string;
+20:   full_name: string | null;
+21:   phone: string | null;
+22:   role: UserRole;
+23:   city: string | null;
+24:   state: string | null;
+25:   avatar_url: string | null;
+26:   created_at: string; // ISO timestamp
+27:   updated_at: string; // ISO timestamp
+28:   // Contractor-specific fields
+29:   location: string | null;  // city/area where contractor operates
+30:   skills: string | null;    // comma-separated list of contractor skills
+31:   years_of_experience: number | null;  // numeric years
+32:   project_types: string | null;  // comma-separated list of project types handled
+33:   company_name: string | null;   // business or company name
+34:   description: string | null;    // short professional description
+35:   resume_path: string | null;    // storage path in contractor-resumes bucket
+36:   resume_url: string | null;     // public URL for resume file
+37:   /**
+38:    * Phase 3 verification status. 'VERIFIED' is the canonical verified-pool
+39:    * status written by admin approval. 'APPROVED' is a legacy value kept for
+40:    * backward compatibility with pre-Phase-3 rows.
+41:    */
+42:   verification_status: 'PENDING' | 'VERIFIED' | 'APPROVED' | 'REJECTED' | null;
+43:   rejection_reason?: string | null;
+44: }
+45: 
+46: // ============================================================
+47: // SignUpData — payload for the public signup form.
+48: // ADMIN is intentionally excluded: admins are created via seed/RBAC only.
+49: // Extended fields for contractor registration:
+50: //   - location: city/area where contractor operates
+51: //   - skills: comma-separated list of contractor skills
+52: //   - years_of_experience: numeric years
+53: //   - project_types: comma-separated list of project types handled
+54: //   - company_name: business or company name
+55: //   - description: short professional description
+56: //   - resume_path: storage path
+57: // ============================================================
+58: export interface SignUpData {
+59:   full_name: string;
+60:   email: string;
+61:   password: string;
+62:   phone?: string;
+63:   role: 'CUSTOMER' | 'CONTRACTOR';
+64:   location?: string;
+65:   skills?: string;
+66:   years_of_experience?: number;
+67:   project_types?: string;
+68:   company_name?: string;
+69:   description?: string;
+70:   resume_path?: string;
+71: }
+72: 
+73: // ============================================================
+74: // ContractorRegistrationData — payload for contractor profile submission
+75: // ============================================================
+76: export interface ContractorRegistrationData {
+77:   full_name: string;
+78:   email: string;
+79:   phone: string;
+80:   location: string;
+81:   skills: string;
+82:   years_of_experience: number;
+83:   project_types: string;
+84:   company_name: string;
+85:   description: string;
+86:   resume_file?: File | null;
+87: }
+88: 
+89: // ============================================================
+90: // AuthResult helpers
+91: // ============================================================
+92: 
+93: /**
+94:  * Consistent result returned by authService.signUp().
+95:  */
+96: export interface SignUpResult {
+97:   user: User | null;
+98:   session: Session | null;
+99:   error: string | null;
+100:   /**
+101:    * True when Supabase email confirmation is enabled and therefore no
+102:    * session was issued (user created, but not yet signed in).
+103:    */
+104:   requiresEmailConfirmation?: boolean;
+105: }
+106: 
+107: /**
+108:  * Consistent result returned by authService.signIn().
+109:  */
+110: export interface SignInResult {
+111:   user: User | null;
+112:   session: Session | null;
+113:   profile: Profile | null;
+114:   /**
+115:    * Real Supabase error from the profile read (RLS / missing table / etc.).
+116:    * Null when the row simply does not exist yet.
+117:    */
+118:   profileError?: string | null;
+119:   error: string | null;
+120: }
+121: 
+122: // ============================================================
+123: // AuthenticatedUser
+124: // ============================================================
+125: export interface AuthenticatedUser {
+126:   id: string;
+127:   email: string;
+128:   profile: Profile | null;
+129: }
+130: 
+131: // ============================================================
+132: // AuthState — the shape exposed by AuthContext
+133: // ============================================================
+134: export interface AuthState {
+135:   user: User | null;
+136:   session: Session | null;
+137:   profile: Profile | null;
+138:   /**
+139:    * Non-null when the profile query failed (RLS / dead table / network).
+140:    * Distinct from profile === null with no error, which means the row is
+141:    * simply missing. Lets the UI differentiate the two instead of showing
+142:    * an infinite "Finishing setup..." screen.
+143:    */
+144:   profileError: string | null;
+145:   loading: boolean;
+146:   signIn: (email: string, password: string) => Promise<void>;
+147:   signUp: (data: SignUpData) => Promise<{ requiresEmailConfirmation: boolean }>;
+148:   signOut: () => Promise<void>;
+149:   refreshProfile: () => Promise<void>;
+150: }
+
+===== src/services/contractorService.ts =====
+1: import { supabase } from '../lib/supabase';
+2: import { Contractor } from '../types';
+3: 
+4: /**
+5:  * Contractor service — read operations for the `contractors` table.
+6:  *
+7:  * Phase 3: the public marketplace service only returns contractors whose
+8:  * `verification_status` is `'VERIFIED'` (or the legacy `'APPROVED'` value
+9:  * kept for backward compatibility). PENDING and REJECTED contractors are
+10:  * NEVER returned here — the filter comes from the database (RLS + query).
+11:  */
+12: 
+13: /** True when a verification status belongs to the verified pool. */
+14: export function isVerificationVerified(status: string | null | undefined): boolean {
+15:   return status === 'VERIFIED' || status === 'APPROVED';
+16: }
+17: 
+18: /**
+19:  * Fetch all verified contractors for the public marketplace from Supabase.
+20:  * Queries `profiles` (and `contractor_profiles`) where
+21:  * `verification_status IN ('VERIFIED', 'APPROVED')`.
+22:  */
+23: export async function getApprovedContractors(): Promise<any[]> {
+24:   try {
+25:     // 1. Try querying public.profiles table first for VERIFIED contractors
+26:     const { data: profileData, error: profileErr } = await supabase
+27:       .from('profiles')
+28:       .select('*')
+29:       .eq('role', 'CONTRACTOR')
+30:       .in('verification_status', ['VERIFIED', 'APPROVED'])
+31:       .order('created_at', { ascending: false });
+32: 
+33:     if (!profileErr && profileData && profileData.length > 0) {
+34:       return profileData.map(mapProfileToMarketplaceContractor);
+35:     }
+36: 
+37:     // 2. Try contractor_profiles table as fallback query
+38:     const { data: contractorData, error: contractorErr } = await supabase
+39:       .from('contractor_profiles')
+40:       .select('*')
+41:       .in('verification_status', ['VERIFIED', 'APPROVED'])
+42:       .order('created_at', { ascending: false });
+43: 
+44:     if (!contractorErr && contractorData && contractorData.length > 0) {
+45:       return contractorData.map(mapContractorProfileToMarketplaceContractor);
+46:     }
+47: 
+48:     // 3. Try legacy contractors table if present
+49:     const { data: legacyData } = await supabase
+50:       .from('contractors')
+51:       .select('*')
+52:       .in('verification_status', ['VERIFIED', 'APPROVED']);
+53: 
+54:     if (legacyData && legacyData.length > 0) {
+55:       return legacyData;
+56:     }
+57: 
+58:     return [];
+59:   } catch (err: any) {
+60:     console.error('[contractorService] getApprovedContractors error:', err?.message || err);
+61:     return [];
+62:   }
+63: }
+64: 
+65: /**
+66:  * Helper to map a Supabase profile row to a Marketplace Contractor object.
+67:  */
+68: export function mapProfileToMarketplaceContractor(p: any): any {
+69:   // NOTE: public.profiles has NO rating / projects_completed / reviews_count
+70:   // columns — those live only on the legacy `contractors` table type.
+71:   // Do not invent per-contractor values; use neutral deterministic
+72:   // placeholders so the existing marketplace UI keeps rendering.
+73:   return {
+74:     id: p.id,
+75:     company: p.company_name || `${p.full_name || 'Verified Contractor'} Builders`,
+76:     owner: p.full_name || 'Verified Contractor',
+77:     experience: p.years_of_experience || 5,
+78:     projects: 35,
+79:     rating: 4.9,
+80:     reviewsCount: 28,
+81:     priceEstimate: 40.0,
+82:     completionTime: 8,
+83:     responseTime: "within 1 hour",
+84:     verified: isVerificationVerified(p.verification_status),
+85:     matchScore: 95,
+86:     matchReason: p.description || "Background-verified, licensed contractor with active insurance.",
+87:     specialty: p.project_types || p.skills || "Residential & Commercial Construction",
+88:     location: p.location || "Bengaluru, Karnataka",
+89:     warranty: 10,
+90:     materialQuality: "Premium A-Grade (Tata Steel, UltraTech)",
+91:     description: p.description || "Licensed contractor verified by BuildSmart AI platform.",
+92:     skills: p.skills || "Construction Management, Civil Engineering, Renovation",
+93:     projectTypes: p.project_types || "Villa, Apartment, Commercial",
+94:     email: p.email,
+95:     phone: p.phone,
+96:     verificationStatus: isVerificationVerified(p.verification_status) ? 'VERIFIED' : (p.verification_status || 'PENDING')
+97:   };
+98: }
+99: 
+100: /**
+101:  * Helper to map a contractor_profiles row to a Marketplace Contractor object.
+102:  */
+103: export function mapContractorProfileToMarketplaceContractor(cp: any): any {
+104:   // NOTE: public.contractor_profiles has NO rating / projects_completed /
+105:   // reviews_count columns — do not read or invent them from the DB row.
+106:   return {
+107:     id: cp.user_id || cp.id,
+108:     company: cp.company_name || `${cp.full_name || 'Verified Contractor'} Infra`,
+109:     owner: cp.full_name || 'Verified Contractor',
+110:     experience: cp.years_of_experience || 5,
+111:     projects: 35,
+112:     rating: 4.9,
+113:     reviewsCount: 28,
+114:     priceEstimate: 40.0,
+115:     completionTime: 8,
+116:     responseTime: "within 45 mins",
+117:     verified: isVerificationVerified(cp.verification_status),
+118:     matchScore: 96,
+119:     matchReason: cp.description || "Verified contractor profile with complete documentation.",
+120:     specialty: cp.project_types || cp.skills || "Residential Construction",
+121:     location: cp.location || "Bengaluru, Karnataka",
+122:     warranty: 10,
+123:     materialQuality: "Premium A-Grade",
+124:     description: cp.description || "Verified contractor profile.",
+125:     skills: cp.skills || "Civil Works, Structural Design",
+126:     projectTypes: cp.project_types || "House, Villa",
+127:     email: cp.email,
+128:     phone: cp.phone,
+129:     verificationStatus: isVerificationVerified(cp.verification_status) ? 'VERIFIED' : (cp.verification_status || 'PENDING')
+130:   };
+131: }
+132: 
+133: /**
+134:  * Fetch a single contractor by its UUID.
+135:  * Only returns the contractor if they are verified (VERIFIED or legacy APPROVED).
+136:  */
+137: export async function getContractorById(contractorId: string): Promise<Contractor | null> {
+138:   const { data, error } = await supabase
+139:     .from('contractors')
+140:     .select('*')
+141:     .eq('id', contractorId)
+142:     .in('verification_status', ['VERIFIED', 'APPROVED'])
+143:     .single();
+144: 
+145:   if (error) {
+146:     console.error('[contractorService] getContractorById failed:', error.message);
+147:     throw new Error(`Failed to fetch contractor: ${error.message}`);
+148:   }
+149: 
+150:   return data as Contractor | null;
+151: }
+152: 
+153: /**
+154:  * Register or update a contractor's professional profile.
+155:  *
+156:  * 1. Uploads resume file to the `contractor-resumes` Supabase storage bucket.
+157:  * 2. Updates `profiles` table with contractor metadata and sets `verification_status` to `'PENDING'`.
+158:  * 3. Upserts into `contractor_profiles` table.
+159:  */
+160: export async function registerContractorProfile(
+161:   userId: string,
+162:   data: {
+163:     full_name: string;
+164:     email: string;
+165:     phone: string;
+166:     location: string;
+167:     skills: string;
+168:     years_of_experience: number;
+169:     project_types: string;
+170:     company_name: string;
+171:     description: string;
+172:     resume_file?: File | null;
+173:   },
+174:   onProgress?: (progress: number) => void
+175: ): Promise<{ success: boolean; resumeUrl?: string; message: string }> {
+176:   let resumePath: string | null = null;
+177:   let resumeUrl: string | null = null;
+178: 
+179:   // 1. Upload resume to Supabase Storage bucket 'contractor-resumes'
+180:   if (data.resume_file) {
+181:     if (onProgress) onProgress(20);
+182:     const safeFileName = data.resume_file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+183:     resumePath = `${userId}/${Date.now()}_${safeFileName}`;
+184: 
+185:     const { error: uploadError } = await supabase.storage
+186:       .from('contractor-resumes')
+187:       .upload(resumePath, data.resume_file, {
+188:         upsert: true,
+189:       });
+190: 
+191:     if (uploadError) {
+192:       console.error('[contractorService] Resume upload error:', uploadError.message);
+193:       throw new Error(`Resume upload failed: ${uploadError.message}`);
+194:     }
+195: 
+196:     if (onProgress) onProgress(60);
+197: 
+198:     const { data: publicUrlData } = supabase.storage
+199:       .from('contractor-resumes')
+200:       .getPublicUrl(resumePath);
+201: 
+202:     resumeUrl = publicUrlData.publicUrl;
+203:   }
+204: 
+205:   if (onProgress) onProgress(80);
+206: 
+207:   // 2. Update profiles table row
+208:   const profileUpdates: Record<string, any> = {
+209:     full_name: data.full_name,
+210:     phone: data.phone,
+211:     company_name: data.company_name,
+212:     location: data.location,
+213:     skills: data.skills,
+214:     years_of_experience: data.years_of_experience,
+215:     project_types: data.project_types,
+216:     description: data.description,
+217:     verification_status: 'PENDING',
+218:     updated_at: new Date().toISOString(),
+219:   };
+220: 
+221:   if (resumePath) profileUpdates.resume_path = resumePath;
+222:   if (resumeUrl) profileUpdates.resume_url = resumeUrl;
+223: 
+224:   const { error: profileError } = await supabase
+225:     .from('profiles')
+226:     .update(profileUpdates)
+227:     .eq('id', userId);
+228: 
+229:   if (profileError) {
+230:     console.error('[contractorService] Profile update error:', profileError.message);
+231:     throw new Error(`Failed to update profile: ${profileError.message}`);
+232:   }
+233: 
+234:   // 3. Upsert contractor_profiles table row
+235:   const contractorProfileRow = {
+236:     user_id: userId,
+237:     full_name: data.full_name,
+238:     email: data.email,
+239:     phone: data.phone,
+240:     company_name: data.company_name,
+241:     location: data.location,
+242:     skills: data.skills,
+243:     years_of_experience: data.years_of_experience,
+244:     project_types: data.project_types,
+245:     description: data.description,
+246:     resume_path: resumePath,
+247:     resume_url: resumeUrl,
+248:     verification_status: 'PENDING',
+249:     updated_at: new Date().toISOString(),
+250:   };
+251: 
+252:   const { error: contractorErr } = await supabase
+253:     .from('contractor_profiles')
+254:     .upsert(contractorProfileRow, { onConflict: 'user_id' });
+255: 
+256:   if (contractorErr) {
+257:     console.warn('[contractorService] contractor_profiles upsert warning:', contractorErr.message);
+258:   }
+259: 
+260:   if (onProgress) onProgress(100);
+261: 
+262:   return {
+263:     success: true,
+264:     resumeUrl: resumeUrl ?? undefined,
+265:     message: 'Registration submitted successfully. Your profile is pending admin verification.',
+266:   };
+267: }
+268: 
+269: /**
+270:  * Fetch contractor profiles filtered by verification_status
+271:  * ('PENDING' | 'VERIFIED' | 'REJECTED' | legacy 'APPROVED').
+272:  * Used by AdminDashboard.
+273:  */
+274: export async function getContractorsByStatus(
+275:   status: 'PENDING' | 'VERIFIED' | 'APPROVED' | 'REJECTED'
+276: ): Promise<any[]> {
+277:   // The VERIFIED pool includes legacy 'APPROVED' rows so pre-Phase-3
+278:   // approvals remain visible under the single "Verified" tab.
+279:   const statuses =
+280:     status === 'VERIFIED' ? ['VERIFIED', 'APPROVED'] : [status];
+281:   const { data, error } = await supabase
+282:     .from('profiles')
+283:     .select('*')
+284:     .eq('role', 'CONTRACTOR')
+285:     .in('verification_status', statuses)
+286:     .order('created_at', { ascending: false });
+287: 
+288:   if (error) {
+289:     console.error(`[contractorService] getContractorsByStatus (${status}) failed:`, error.message);
+290:     throw new Error(`Failed to load ${status.toLowerCase()} contractors: ${error.message}`);
+291:   }
+292: 
+293:   return data ?? [];
+294: }
+295: 
+296: /**
+297:  * Update a contractor's verification status (ADMIN action).
+298:  * Admin approval writes 'VERIFIED' — the canonical verified-pool status.
+299:  * Updates both `profiles` and `contractor_profiles` tables.
+300:  */
+301: export async function updateContractorVerification(
+302:   contractorUserId: string,
+303:   status: 'VERIFIED' | 'REJECTED' | 'PENDING' | 'APPROVED',
+304:   rejectionReason?: string
+305: ): Promise<void> {
+306:   const updates: Record<string, any> = {
+307:     verification_status: status,
+308:   };
+309: 
+310:   // A rejection carries a human-readable reason; approving clears it.
+311:   if (status === 'REJECTED') {
+312:     updates.rejection_reason = (rejectionReason || '').trim() || 'No reason provided';
+313:   } else {
+314:     updates.rejection_reason = null;
+315:   }
+316:   updates.updated_at = new Date().toISOString();
+317: 
+318:   const { error: profileError } = await supabase
+319:     .from('profiles')
+320:     .update(updates)
+321:     .eq('id', contractorUserId);
+322: 
+323:   if (profileError) {
+324:     console.error('[contractorService] updateContractorVerification failed on profiles:', profileError.message);
+325:     throw new Error(`Verification update failed: ${profileError.message}`);
+326:   }
+327: 
+328:   // Also sync contractor_profiles table
+329:   const { error: contractorErr } = await supabase
+330:     .from('contractor_profiles')
+331:     .update(updates)
+332:     .eq('user_id', contractorUserId);
+333: 
+334:   if (contractorErr) {
+335:     console.warn('[contractorService] updateContractorVerification warning on contractor_profiles:', contractorErr.message);
+336:   }
+337: }
+338: 
+339: /**
+340:  * Generate a secure 1-hour signed URL for viewing/downloading a contractor's resume.
+341:  */
+342: export async function getSignedResumeUrl(resumePathOrUrl: string): Promise<string> {
+343:   if (!resumePathOrUrl) {
+344:     throw new Error('No resume file path provided.');
+345:   }
+346: 
+347:   // If it's already a full HTTP URL, check if we need to sign a path
+348:   if (resumePathOrUrl.startsWith('http://') || resumePathOrUrl.startsWith('https://')) {
+349:     // Extract storage path if it's from contractor-resumes bucket
+350:     const match = resumePathOrUrl.match(/\/contractor-resumes\/(.+)$/);
+351:     if (match && match[1]) {
+352:       const storagePath = decodeURIComponent(match[1]);
+353:       const { data, error } = await supabase.storage
+354:         .from('contractor-resumes')
+355:         .createSignedUrl(storagePath, 3600); // 1 hour validity
+356: 
+357:       if (!error && data?.signedUrl) {
+358:         return data.signedUrl;
+359:       }
+360:     }
+361:     return resumePathOrUrl;
+362:   }
+363: 
+364:   // Generate signed URL from storage path
+365:   const { data, error } = await supabase.storage
+366:     .from('contractor-resumes')
+367:     .createSignedUrl(resumePathOrUrl, 3600);
+368: 
+369:   if (error || !data?.signedUrl) {
+370:     console.warn('[contractorService] getSignedResumeUrl failed, falling back to public URL:', error?.message);
+371:     const { data: publicData } = supabase.storage
+372:       .from('contractor-resumes')
+373:       .getPublicUrl(resumePathOrUrl);
+374:     return publicData.publicUrl;
+375:   }
+376: 
+377:   return data.signedUrl;
+378: }
+
+===== src/pages/AdminDashboard.tsx =====
+1: import React, { useEffect, useState } from 'react';
+2: import {
+3:   Users, ShieldCheck, AlertCircle, Check, X,
+4:   FileText, Clock, MapPin, Briefcase, Eye, Loader2, RefreshCw,
+5:   Mail, Phone, Building2, CheckCircle2, ExternalLink, ArrowRight, XCircle,
+6: } from 'lucide-react';
+7: import {
+8:   getContractorsByStatus,
+9:   updateContractorVerification,
+10:   getSignedResumeUrl,
+11:   isVerificationVerified,
+12: } from '../services/contractorService';
+13: 
+14: // ============================================================
+15: // Phase 3 — REAL Admin Contractor Verification
+16: // ============================================================
+17: // Clear, DB-backed statuses:
+18: //   PENDING  -> application awaiting admin review (amber)
+19: //   VERIFIED -> admin-approved. THE ONLY status allowed in the
+20: //               verified contractor pool / recommendations (green).
+21: //               Every approval writes verification_status = 'VERIFIED'
+22: //               to public.profiles + public.contractor_profiles.
+23: //   REJECTED -> rejected with a stored rejection_reason (red).
+24: // Legacy 'APPROVED' is displayed as "Verified" for backward
+25: // compatibility (see isVerificationVerified).
+26: // ============================================================
+27: 
+28: type VerificationStatus = 'PENDING' | 'VERIFIED' | 'APPROVED' | 'REJECTED' | null;
+29: type AdminTab = 'PENDING' | 'VERIFIED' | 'REJECTED';
+30: 
+31: /** Mirrors the actual columns of the public.profiles row for a contractor. */
+32: interface ContractorRecord {
+33:   id: string;
+34:   email: string | null;
+35:   full_name: string | null;
+36:   phone: string | null;
+37:   company_name: string | null;
+38:   location: string | null;
+39:   skills: string | null;
+40:   years_of_experience: number | null;
+41:   project_types: string | null;
+42:   description: string | null;
+43:   resume_path: string | null;
+44:   resume_url: string | null;
+45:   verification_status: VerificationStatus;
+46:   rejection_reason?: string | null;
+47:   created_at: string;
+48: }
+49: 
+50: const statusLabel = (s: VerificationStatus): string => {
+51:   if (isVerificationVerified(s)) return 'Verified';
+52:   if (s === 'REJECTED') return 'Rejected';
+53:   return 'Pending';
+54: };
+55: 
+56: /** Convert a profile row to the admin ContractorRecord shape (no guessed fields). */
+57: function toContractorRecord(row: any): ContractorRecord {
+58:   return {
+59:     id: String(row.id),
+60:     email: row.email ?? null,
+61:     full_name: row.full_name ?? null,
+62:     phone: row.phone ?? null,
+63:     company_name: row.company_name ?? null,
+64:     location: row.location ?? null,
+65:     skills: row.skills ?? null,
+66:     years_of_experience:
+67:       row.years_of_experience == null ? null : Number(row.years_of_experience),
+68:     project_types: row.project_types ?? null,
+69:     description: row.description ?? null,
+70:     resume_path: row.resume_path ?? null,
+71:     resume_url: row.resume_url ?? null,
+72:     verification_status: row.verification_status ?? 'PENDING',
+73:     rejection_reason: row.rejection_reason ?? null,
+74:     created_at: String(row.created_at ?? ''),
+75:   };
+76: }
+77: 
+78: export const AdminDashboard: React.FC = () => {
+79:   const [activeTab, setActiveTab] = useState<AdminTab>('PENDING');
+80:   const [contractors, setContractors] = useState<ContractorRecord[]>([]);
+81:   const [loading, setLoading] = useState<boolean>(true);
+82:   const [error, setError] = useState<string | null>(null);
+83: 
+84:   const [selected, setSelected] = useState<ContractorRecord | null>(null);
+85:   const [resumeUrl, setResumeUrl] = useState<string | null>(null);
+86:   const [resumeLoading, setResumeLoading] = useState(false);
+87: 
+88:   const [rejectReason, setRejectReason] = useState('');
+89:   const [actionBusy, setActionBusy] = useState(false);
+90: 
+91:   const [changeOpen, setChangeOpen] = useState(false);
+92:   const [nextStatus, setNextStatus] = useState<'VERIFIED' | 'REJECTED' | 'PENDING'>('VERIFIED');
+93:   const [changeError, setChangeError] = useState<string | null>(null);
+94: 
+95:   const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+96:   const [toastTimer, setToastTimer] = useState<number | null>(null);
+97: 
+98:   const showToast = (type: 'success' | 'error', message: string) => {
+99:     if (toastTimer) window.clearTimeout(toastTimer);
+100:     setToast({ type, message });
+101:     const timer = window.setTimeout(() => setToast(null), 5200);
+102:     setToastTimer(timer);
+103:   };
+104: 
+105:   const loadContractors = async () => {
+106:     setLoading(true);
+107:     setError(null);
+108:     try {
+109:       const data = await getContractorsByStatus(activeTab);
+110:       setContractors((data ?? []).map(toContractorRecord));
+111:     } catch (err: any) {
+112:       console.error('[AdminDashboard] Failed to load contractors:', err?.message);
+113:       setError(err?.message || 'Failed to load contractors.');
+114:       setContractors([]);
+115:     } finally {
+116:       setLoading(false);
+117:     }
+118:   };
+119: 
+120:   useEffect(() => {
+121:     void loadContractors();
+122:   }, [activeTab]);
+123: 
+124:   const openDetails = async (c: ContractorRecord) => {
+125:     setSelected(c);
+126:     setResumeUrl(null);
+127:     setRejectReason('');
+128:     setChangeOpen(false);
+129:     setChangeError(null);
+130:     setNextStatus('VERIFIED');
+131:     if (c.resume_path || c.resume_url) {
+132:       setResumeLoading(true);
+133:       try {
+134:         const url = await getSignedResumeUrl(c.resume_url || c.resume_path || '');
+135:         setResumeUrl(url);
+136:       } catch (err: any) {
+137:         console.warn('[AdminDashboard] Resume URL failed:', err?.message);
+138:         setResumeUrl(null);
+139:       } finally {
+140:         setResumeLoading(false);
+141:       }
+142:     }
+143:   };
+144: 
+145:   const closeDetails = () => {
+146:     setSelected(null);
+147:     setResumeUrl(null);
+148:     setChangeOpen(false);
+149:     setChangeError(null);
+150:     setRejectReason('');
+151:   };
+152: 
+153:   const patchLocalStatus = (id: string, status: VerificationStatus, reason?: string | null) => {
+154:     setContractors(prev =>
+155:       prev.map(c => (c.id === id ? { ...c, verification_status: status, rejection_reason: reason } : c))
+156:     );
+157:   };
+158: 
+159:   const handleApprove = async (c: ContractorRecord) => {
+160:     setActionBusy(true);
+161:     try {
+162:       await updateContractorVerification(c.id, 'VERIFIED');
+163:       patchLocalStatus(c.id, 'VERIFIED', null);
+164:       showToast('success', `${c.full_name || c.company_name || 'Contractor'} is now Verified.`);
+165:       setSelected(null);
+166:       setActiveTab('VERIFIED');
+167:     } catch (err: any) {
+168:       console.error('[AdminDashboard] Approve failed:', err?.message);
+169:       showToast('error', `Approval failed: ${err?.message || 'Unknown error'}`);
+170:     } finally {
+171:       setActionBusy(false);
+172:     }
+173:   };
+174: 
+175:   const handleReject = async (c: ContractorRecord) => {
+176:     const reason = rejectReason.trim();
+177:     if (!reason) {
+178:       showToast('error', 'Please enter a rejection reason before rejecting.');
+179:       return;
+180:     }
+181:     setActionBusy(true);
+182:     try {
+183:       await updateContractorVerification(c.id, 'REJECTED', reason);
+184:       patchLocalStatus(c.id, 'REJECTED', reason);
+185:       showToast('success', `${c.full_name || c.company_name || 'Contractor'} was rejected with a reason.`);
+186:       setSelected(null);
+187:       setActiveTab('REJECTED');
+188:     } catch (err: any) {
+189:       console.error('[AdminDashboard] Reject failed:', err?.message);
+190:       showToast('error', `Rejection failed: ${err?.message || 'Unknown error'}`);
+191:     } finally {
+192:       setActionBusy(false);
+193:     }
+194:   };
+195: 
+196:   const handleChangeStatus = async (c: ContractorRecord) => {
+197:     setActionBusy(true);
+198:     setChangeError(null);
+199:     try {
+200:       await updateContractorVerification(
+201:         c.id,
+202:         nextStatus,
+203:         nextStatus === 'REJECTED' ? (rejectReason.trim() || undefined) : undefined
+204:       );
+205:       patchLocalStatus(
+206:         c.id,
+207:         nextStatus,
+208:         nextStatus === 'REJECTED' ? (rejectReason.trim() || null) : null
+209:       );
+210:       showToast('success', `Status changed to ${statusLabel(nextStatus)}.`);
+211:       setSelected(null);
+212:       setChangeOpen(false);
+213:       setRejectReason('');
+214:       setActiveTab(
+215:         nextStatus === 'VERIFIED'
+216:           ? 'VERIFIED'
+217:           : nextStatus === 'REJECTED' ? 'REJECTED' : 'PENDING'
+218:       );
+219:     } catch (err: any) {
+220:       console.error('[AdminDashboard] Status change failed:', err?.message);
+221:       setChangeError(err?.message || 'Status change failed.');
+222:     } finally {
+223:       setActionBusy(false);
+224:     }
+225:   };
+226: 
+227:   const statusBadge = (s: VerificationStatus) => {
+228:     if (isVerificationVerified(s)) {
+229:       return (
+230:         <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-extrabold bg-emerald-50 text-emerald-800 border border-emerald-300 shadow-sm">
+231:           <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" /> Verified
+232:         </span>
+233:       );
+234:     }
+235:     if (s === 'REJECTED') {
+236:       return (
+237:         <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-extrabold bg-red-50 text-red-700 border border-red-200 shadow-sm">
+238:           <XCircle className="w-3.5 h-3.5 text-red-500" /> Rejected
+239:         </span>
+240:       );
+241:     }
+242:     return (
+243:       <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-extrabold bg-amber-50 text-amber-800 border border-amber-200 shadow-sm">
+244:         <Clock className="w-3.5 h-3.5 text-amber-600" /> Pending
+245:       </span>
+246:     );
+247:   };
+248: 
+249:   return (
+250:     <div className="space-y-8 max-w-7xl mx-auto py-6 px-4">
+251:       {/* Header */}
+252:       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+253:         <div>
+254:           <div className="flex items-center gap-2 mb-1">
+255:             <h1 className="text-3xl font-extrabold text-neutral-900 tracking-tight">Contractor Verification</h1>
+256:             <Users className="w-7 h-7 text-terracotta" />
+257:           </div>
+258:           <p className="text-neutral-500 font-light text-sm max-w-3xl">
+259:             Review contractor applications stored in Supabase. Approving a contractor writes
+260:             <strong className="text-emerald-700">VERIFIED</strong> to the database — only verified
+261:             contractors are recommended to customers.
+262:           </p>
+263:         </div>
+264:         <button
+265:           onClick={() => void loadContractors()}
+266:           disabled={loading}
+267:           className="px-4 py-2 bg-terracotta hover:bg-terracotta-600 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 transition-all disabled:opacity-50"
+268:         >
+269:           <RefreshCw className={"w-3.5 h-3.5 " + (loading ? "animate-spin" : "")} /> Refresh
+270:         </button>
+271:       </div>
+272: 
+273:       {/* Toast */}
+274:       {toast && (
+275:         <div
+276:           className={`rounded-2xl border px-5 py-3.5 text-sm font-semibold flex items-start gap-2.5 ${
+277:             toast.type === 'success'
+278:               ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+279:               : 'border-red-200 bg-red-50 text-red-700'
+280:           }`}
+281:         >
+282:           {toast.type === 'success'
+283:             ? <CheckCircle2 className="w-5 h-5 text-emerald-600 mt-0.5 flex-shrink-0" />
+284:             : <AlertCircle className="w-5 h-5 text-red-600 mt-0.5 flex-shrink-0" />}
+285:           {toast.message}
+286:         </div>
+287:       )}
+288: 
+289:       {/* Status Tabs */}
+290:       <div className="flex flex-wrap gap-3">
+291:         {([
+292:           { value: 'PENDING', label: 'Pending' },
+293:           { value: 'VERIFIED', label: 'Verified' },
+294:           { value: 'REJECTED', label: 'Rejected' },
+295:         ] as { value: AdminTab; label: string }[]).map(tab => (
+296:           <button
+297:             key={tab.value}
+298:             type="button"
+299:             onClick={() => setActiveTab(tab.value)}
+300:             className={`px-5 py-2.5 rounded-xl text-xs font-extrabold transition-all ${
+301:               activeTab === tab.value
+302:                 ? tab.value === 'VERIFIED'
+303:                   ? 'bg-emerald-600 text-white shadow-sm'
+304:                   : tab.value === 'REJECTED'
+305:                     ? 'bg-red-600 text-white shadow-sm'
+306:                     : 'bg-amber-500 text-white shadow-sm'
+307:                 : 'border border-neutral-200 text-neutral-600 bg-white hover:bg-neutral-50'
+308:             }`}
+309:           >
+310:             {tab.label}
+311:             {contractors.length > 0 && activeTab === tab.value && (
+312:               <span className="ml-1.5 px-2 py-0.5 rounded-full bg-white/20 text-[10px] font-bold">
+313:                 {contractors.length}
+314:               </span>
+315:             )}
+316:           </button>
+317:         ))}
+318:       </div>
+319: 
+320:       {/* Loading Skeleton */}
+321:       {loading && (
+322:         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+323:           {[1, 2, 3].map(i => (
+324:             <div key={i} className="bg-white border border-neutral-200 rounded-3xl p-6 shadow-premium animate-pulse space-y-4">
+325:               <div className="flex items-center gap-3">
+326:                 <div className="w-12 h-12 rounded-2xl bg-neutral-200" />
+327:                 <div className="space-y-1.5 flex-1">
+328:                   <div className="h-4 bg-neutral-200 rounded w-2/3" />
+329:                   <div className="h-3 bg-neutral-100 rounded w-1/2" />
+330:                 </div>
+331:               </div>
+332:               <div className="h-3 bg-neutral-100 rounded w-full" />
+333:               <div className="h-3 bg-neutral-100 rounded w-5/6" />
+334:               <div className="h-8 bg-neutral-200 rounded-xl w-1/2" />
+335:             </div>
+336:           ))}
+337:         </div>
+338:       )}
+339: 
+340:       {/* Error Alert */}
+341:       {!loading && error && (
+342:         <div className="p-4 rounded-2xl bg-red-50 border border-red-200 text-red-800 flex items-center justify-between gap-3 text-xs font-semibold">
+343:           <div className="flex items-center gap-2">
+344:             <AlertCircle className="w-4 h-4 text-red-600" />
+345:             <span>{error}</span>
+346:           </div>
+347:           <button
+348:             onClick={() => void loadContractors()}
+349:             className="px-3 py-1.5 bg-red-200 hover:bg-red-300 text-red-900 rounded-lg transition-colors flex items-center gap-1"
+350:           >
+351:             <RefreshCw className="w-3.5 h-3.5" /> Retry
+352:           </button>
+353:         </div>
+354:       )}
+355: 
+356:       {/* Empty State per tab */}
+357:       {!loading && !error && contractors.length === 0 && (
+358:         <div className="bg-white border border-neutral-200 rounded-3xl p-12 text-center space-y-4 shadow-premium">
+359:           <div className="w-14 h-14 rounded-2xl bg-neutral-100 text-neutral-400 flex items-center justify-center mx-auto">
+360:             <Users className="w-7 h-7" />
+361:           </div>
+362:           <h3 className="font-bold text-neutral-900 text-base">
+363:             No {statusLabel(activeTab).toLowerCase()} contractors
+364:           </h3>
+365:           <p className="text-xs text-neutral-500 max-w-sm mx-auto font-light">
+366:             {activeTab === 'PENDING'
+367:               ? 'New contractor applications appear here as soon as they register.'
+368:               : activeTab === 'VERIFIED'
+369:                 ? 'Approved contractors appear here and are eligible for customer recommendations.'
+370:                 : 'Rejected contractors and their rejection reasons appear here.'}
+371:           </p>
+372:         </div>
+373:       )}
+374:       {/* Contractor Cards */}
+375:       {!loading && !error && contractors.length > 0 && (
+376:         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+377:           {contractors.map(c => {
+378:             const displayName = c.company_name || c.full_name || 'Unnamed Contractor';
+379:             return (
+380:               <div key={c.id} className="bg-white border border-neutral-200 rounded-3xl p-6 shadow-premium flex flex-col gap-3">
+381:                 <div className="flex items-center gap-3">
+382:                   <div className="w-12 h-12 rounded-2xl bg-neutral-900 text-white flex items-center justify-center font-extrabold text-lg flex-shrink-0">
+383:                     {displayName.charAt(0)}
+384:                   </div>
+385:                   <div className="min-w-0 flex-1">
+386:                     <h3 className="font-extrabold text-neutral-900 text-sm truncate">{displayName}</h3>
+387:                     <p className="text-[11px] text-neutral-500 truncate">{c.full_name || '—'}</p>
+388:                   </div>
+389:                   {statusBadge(c.verification_status)}
+390:                 </div>
+391: 
+392:                 <div className="space-y-1 text-[11px] text-neutral-600">
+393:                   <p className="flex items-center gap-1.5 truncate">
+394:                     <Mail className="w-3.5 h-3.5 text-neutral-400" /> {c.email || 'No email'}
+395:                   </p>
+396:                   <p className="flex items-center gap-1.5 truncate">
+397:                     <Phone className="w-3.5 h-3.5 text-neutral-400" /> {c.phone || 'No phone'}
+398:                   </p>
+399:                   <p className="flex items-center gap-1.5 truncate">
+400:                     <MapPin className="w-3.5 h-3.5 text-neutral-400" /> {c.location || 'No location'}
+401:                   </p>
+402:                   <p className="flex items-center gap-1.5 truncate">
+403:                     <Briefcase className="w-3.5 h-3.5 text-neutral-400" />
+404:                     {c.years_of_experience != null ? `${c.years_of_experience} years experience` : 'Experience not given'}
+405:                   </p>
+406:                 </div>
+407: 
+408:                 {c.skills && (
+409:                   <p className="text-[10px] text-terracotta font-semibold truncate">{c.skills}</p>
+410:                 )}
+411:                 {c.rejection_reason && (
+412:                   <p className="text-[10px] text-red-600 truncate">Reason: {c.rejection_reason}</p>
+413:                 )}
+414: 
+415:                 <div className="flex flex-wrap gap-2 pt-2 border-t border-neutral-100">
+416:                   <button
+417:                     type="button"
+418:                     onClick={() => void openDetails(c)}
+419:                     className="px-3 py-1.5 rounded-xl border border-terracotta text-terracotta text-xs font-semibold hover:bg-terracotta-50 transition-all inline-flex items-center gap-1"
+420:                   >
+421:                     <Eye className="w-3.5 h-3.5" /> View Details
+422:                   </button>
+423:                   {(c.resume_path || c.resume_url) && (
+424:                     <button
+425:                       type="button"
+426:                       onClick={() => void openDetails(c)}
+427:                       className="px-3 py-1.5 rounded-xl border border-neutral-200 text-neutral-600 text-xs font-semibold hover:bg-neutral-50 transition-all inline-flex items-center gap-1"
+428:                     >
+429:                       <FileText className="w-3.5 h-3.5" /> Resume
+430:                     </button>
+431:                   )}
+432:                   {!isVerificationVerified(c.verification_status) && c.verification_status !== 'REJECTED' && (
+433:                     <button
+434:                       type="button"
+435:                       disabled={actionBusy}
+436:                       onClick={() => void handleApprove(c)}
+437:                       className="px-3 py-1.5 rounded-xl bg-emerald-600 text-white text-xs font-bold hover:bg-emerald-700 transition-all inline-flex items-center gap-1 disabled:opacity-50"
+438:                     >
+439:                       <Check className="w-3.5 h-3.5" /> Approve
+440:                     </button>
+441:                   )}
+442:                 </div>
+443:               </div>
+444:             );
+445:           })}
+446:         </div>
+447:       )}
+448:       {/* Details Modal */}
+449:       {selected && (
+450:         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 overflow-y-auto">
+451:           <div
+452:             className="absolute inset-0 bg-black/50"
+453:             onClick={closeDetails}
+454:           />
+455:           <div className="relative bg-white max-w-2xl w-full max-h-[92vh] overflow-y-auto rounded-3xl shadow-2xl border border-neutral-200 p-6 space-y-5">
+456:             {/* Modal header */}
+457:             <div className="flex items-center justify-between gap-3">
+458:               <div className="flex items-center gap-3 min-w-0">
+459:                 <div className="w-12 h-12 rounded-2xl bg-neutral-900 text-white flex items-center justify-center font-extrabold text-lg flex-shrink-0">
+460:                   {(selected.company_name || selected.full_name || 'C').charAt(0)}
+461:                 </div>
+462:                 <div className="min-w-0">
+463:                   <h2 className="font-extrabold text-neutral-900 text-lg truncate">
+464:                     {selected.company_name || selected.full_name || 'Unnamed Contractor'}
+465:                   </h2>
+466:                   <p className="text-[11px] text-neutral-500 truncate">
+467:                     {selected.full_name || 'Contractor'} · {selected.email || 'No email'}
+468:                   </p>
+469:                 </div>
+470:               </div>
+471:               <div className="flex items-center gap-2">
+472:                 {statusBadge(selected.verification_status)}
+473:                 <button
+474:                   onClick={closeDetails}
+475:                   className="p-2 rounded-xl text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-all"
+476:                 >
+477:                   <X className="w-5 h-5" />
+478:                 </button>
+479:               </div>
+480:             </div>
+481: 
+482:             {/* Contact / basics */}
+483:             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+484:               <div className="p-3 rounded-2xl bg-neutral-50 space-y-1">
+485:                 <span className="text-[10px] font-bold text-neutral-400 uppercase">Email</span>
+486:                 <p className="text-xs font-semibold flex items-center gap-1.5 truncate">
+487:                   <Mail className="w-3.5 h-3.5 text-neutral-400" /> {selected.email || '—'}
+488:                 </p>
+489:               </div>
+490:               <div className="p-3 rounded-2xl bg-neutral-50 space-y-1">
+491:                 <span className="text-[10px] font-bold text-neutral-400 uppercase">Phone</span>
+492:                 <p className="text-xs font-semibold flex items-center gap-1.5 truncate">
+493:                   <Phone className="w-3.5 h-3.5 text-neutral-400" /> {selected.phone || '—'}
+494:                 </p>
+495:               </div>
+496:               <div className="p-3 rounded-2xl bg-neutral-50 space-y-1">
+497:                 <span className="text-[10px] font-bold text-neutral-400 uppercase">Location</span>
+498:                 <p className="text-xs font-semibold flex items-center gap-1.5 truncate">
+499:                   <MapPin className="w-3.5 h-3.5 text-neutral-400" /> {selected.location || '—'}
+500:                 </p>
+501:               </div>
+502:               <div className="p-3 rounded-2xl bg-neutral-50 space-y-1">
+503:                 <span className="text-[10px] font-bold text-neutral-400 uppercase">Experience</span>
+504:                 <p className="text-xs font-semibold flex items-center gap-1.5">
+505:                   <Briefcase className="w-3.5 h-3.5 text-neutral-400" />
+506:                   {selected.years_of_experience != null ? `${selected.years_of_experience} years` : '—'}
+507:                 </p>
+508:               </div>
+509:             </div>
+510: 
+511:             {/* Previous projects / expertise */}
+512:             {selected.project_types && (
+513:               <div className="space-y-1">
+514:                 <span className="text-[10px] font-bold text-neutral-400 uppercase tracking-wider block">
+515:                   Previous Project Information
+516:                 </span>
+517:                 <p className="text-xs font-semibold text-terracotta bg-terracotta-50/40 p-3 rounded-xl border border-terracotta-100">
+518:                   {selected.project_types}
+519:                 </p>
+520:               </div>
+521:             )}
+522: 
+523:             {selected.skills && (
+524:               <div className="space-y-1">
+525:                 <span className="text-[10px] font-bold text-neutral-400 uppercase tracking-wider block">Skills</span>
+526:                 <p className="text-xs font-medium text-neutral-700 bg-neutral-50 p-3 rounded-xl border border-neutral-100">
+527:                   {selected.skills}
+528:                 </p>
+529:               </div>
+530:             )}
+531: 
+532:             {selected.description && (
+533:               <div className="space-y-1">
+534:                 <span className="text-[10px] font-bold text-neutral-400 uppercase tracking-wider block">Portfolio Information</span>
+535:                 <p className="text-xs text-neutral-600 font-light leading-relaxed bg-neutral-50 p-3.5 rounded-xl border border-neutral-100">
+536:                   {selected.description}
+537:                 </p>
+538:               </div>
+539:             )}
+540:             {/* Resume */}
+541:             <div className="p-3 rounded-2xl bg-neutral-50 border border-neutral-100 space-y-2">
+542:               <span className="text-[10px] font-bold text-neutral-400 uppercase tracking-wider block">Resume</span>
+543:               {resumeLoading ? (
+544:                 <p className="text-xs text-neutral-500 flex items-center gap-1.5">
+545:                   <Loader2 className="w-3.5 h-3.5 animate-spin text-terracotta" /> Generating secure link...
+546:                 </p>
+547:               ) : resumeUrl ? (
+548:                 <div className="flex flex-wrap items-center gap-2">
+549:                   <span className="text-xs font-semibold text-emerald-700 flex items-center gap-1.5">
+550:                     <CheckCircle2 className="w-3.5 h-3.5" /> Resume available
+551:                   </span>
+552:                   <a
+553:                     href={resumeUrl}
+554:                     target="_blank"
+555:                     rel="noopener noreferrer"
+556:                     className="px-3 py-1.5 rounded-xl border border-terracotta text-terracotta text-xs font-bold hover:bg-terracotta-50 transition-all inline-flex items-center gap-1"
+557:                   >
+558:                     <ExternalLink className="w-3.5 h-3.5" /> View / Download
+559:                   </a>
+560:                 </div>
+561:               ) : (
+562:                 <p className="text-xs text-neutral-400 italic">No resume uploaded.</p>
+563:               )}
+564:             </div>
+565: 
+566:             {/* Rejection reason */}
+567:             {selected.verification_status === 'REJECTED' && selected.rejection_reason && (
+568:               <div className="p-3 rounded-2xl bg-red-50 border border-red-200 space-y-1">
+569:                 <span className="text-[10px] font-bold text-red-700 uppercase tracking-wider block">Rejection Reason</span>
+570:                 <p className="text-xs text-red-700 font-medium">{selected.rejection_reason}</p>
+571:               </div>
+572:             )}
+573: 
+574:             {/* Verification actions */}
+575:             <div className="border-t border-neutral-100 pt-4 space-y-3">
+576:               <span className="text-[10px] font-bold text-neutral-400 uppercase tracking-wider block">Verification Actions</span>
+577: 
+578:               <div className="flex flex-wrap gap-2">
+579:                 {!isVerificationVerified(selected.verification_status) && (
+580:                   <button
+581:                     type="button"
+582:                     disabled={actionBusy}
+583:                     onClick={() => void handleApprove(selected)}
+584:                     className="px-4 py-2 rounded-xl bg-emerald-600 text-white text-xs font-bold hover:bg-emerald-700 transition-all inline-flex items-center gap-1.5 disabled:opacity-50"
+585:                   >
+586:                     <Check className="w-3.5 h-3.5" /> Approve Contractor
+587:                   </button>
+588:                 )}
+589:                 <button
+590:                   type="button"
+591:                   disabled={actionBusy}
+592:                   onClick={() => {
+593:                     setNextStatus('REJECTED');
+594:                     setChangeError(null);
+595:                     setChangeOpen(true);
+596:                   }}
+597:                   className="px-4 py-2 rounded-xl bg-red-600 text-white text-xs font-bold hover:bg-red-700 transition-all inline-flex items-center gap-1.5 disabled:opacity-50"
+598:                 >
+599:                   <X className="w-3.5 h-3.5" /> Reject
+600:                 </button>
+601:                 <button
+602:                   type="button"
+603:                   disabled={actionBusy}
+604:                   onClick={() => {
+605:                     setNextStatus(isVerificationVerified(selected.verification_status) ? 'PENDING' : 'VERIFIED');
+606:                     setChangeError(null);
+607:                     setChangeOpen(!changeOpen);
+608:                   }}
+609:                   className="px-4 py-2 rounded-xl border border-neutral-200 text-neutral-700 text-xs font-bold hover:bg-neutral-50 transition-all inline-flex items-center gap-1.5 disabled:opacity-50"
+610:                 >
+611:                   <ArrowRight className="w-3.5 h-3.5" /> Change Status
+612:                 </button>
+613:               </div>
+614:               {/* Change status form */}
+615:               {changeOpen && (
+616:                 <div className="p-4 rounded-2xl bg-neutral-50 border border-neutral-200 space-y-3">
+617:                   <label className="text-[10px] font-bold text-neutral-400 uppercase block">Change verification status</label>
+618:                   <select
+619:                     value={nextStatus}
+620:                     onChange={e => setNextStatus(e.target.value as 'VERIFIED' | 'REJECTED' | 'PENDING')}
+621:                     className="w-full px-3 py-2 rounded-xl border border-neutral-200 text-xs font-semibold text-neutral-800 bg-white cursor-pointer"
+622:                   >
+623:                     <option value="VERIFIED">Verified (recommended to customers)</option>
+624:                     <option value="REJECTED">Rejected</option>
+625:                     <option value="PENDING">Pending</option>
+626:                   </select>
+627: 
+628:                   {nextStatus === 'REJECTED' && (
+629:                     <textarea
+630:                       value={rejectReason}
+631:                       onChange={e => setRejectReason(e.target.value)}
+632:                       rows={3}
+633:                       placeholder="Enter the rejection reason (shown to the contractor)..."
+634:                       className="w-full px-3 py-2 rounded-xl border border-neutral-200 text-xs font-semibold text-neutral-800 bg-white"
+635:                     />
+636:                   )}
+637: 
+638:                   {changeError && (
+639:                     <p className="text-[11px] text-red-600">{changeError}</p>
+640:                   )}
+641: 
+642:                   <button
+643:                     type="button"
+644:                     disabled={actionBusy}
+645:                     onClick={() => void handleChangeStatus(selected)}
+646:                     className="w-full py-2.5 rounded-xl bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 transition-all inline-flex items-center justify-center gap-1.5 disabled:opacity-50"
+647:                   >
+648:                     {actionBusy ? (
+649:                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
+650:                     ) : (
+651:                       <CheckCircle2 className="w-3.5 h-3.5" />
+652:                     )}
+653:                     Apply Status Change
+654:                   </button>
+655:                 </div>
+656:               )}
+657:             </div>
+658: 
+659:             <div className="flex justify-end pt-2 border-t border-neutral-100">
+660:               <button
+661:                 onClick={closeDetails}
+662:                 className="px-5 py-2 rounded-xl bg-terracotta text-white text-xs font-bold"
+663:               >
+664:                 Close
+665:               </button>
+666:             </div>
+667:           </div>
+668:         </div>
+669:       )}
+670:     </div>
+671:   );
+672: };
+673: 
+
+===== src/types/project.ts =====
+1: /**
+2:  * Project types — canonical BuildSmart project domain types (Phase 4).
+3:  *
+4:  * These mirror the REAL public.projects columns. The live Supabase database
+5:  * currently exposes the base columns (id, customer_id, name, building_type,
+6:  * description, city, state, built_up_area, floors, bedrooms, bathrooms,
+7:  * budget, soil_type, status, priority, design_style, created_at, updated_at)
+8:  * plus a legacy status CHECK constraint (PLANNING / IN_PROGRESS /
+9:  * COMPLETED / CANCELLED).
+10:  *
+11:  * The Phase-4 columns (project_type, plot_size, budget_min, budget_max,
+12:  * construction_stage, requirements, contractor_id) are added by
+13:  * supabase/migrations/20260816130000_projects_customer_rls.sql — they are
+14:  * OPTIONAL in the payload types because the insert only sends a column when
+15:  * it actually exists in the live database (see projectService.ts).
+16:  *
+17:  * Legacy single-column `budget` maps the old form's single "Expected Budget"
+18:  * field to the live `budget` column.
+19:  *
+20:  * `customer_id` is intentionally NOT part of CreateProjectData/UpdateProjectData:
+21:  * the service resolves it from supabase.auth.getUser() and rejects requests
+22:  * from unauthenticated users ("Please log in to create a project.").
+23:  */
+24: 
+25: export type ProjectType =
+26:   | 'NEW_CONSTRUCTION'
+27:   | 'RENOVATION'
+28:   | 'INTERIOR_DESIGN';
+29: 
+30: /**
+31:  * Status union covering BOTH the live legacy constraint
+32:  * (PLANNING / IN_PROGRESS / COMPLETED / CANCELLED) and the Phase-4 migration
+33:  * list (DRAFT / SUBMITTED / IN_PROGRESS / COMPLETED / CANCELLED).
+34:  */
+35: export type ProjectStatus =
+36:   | 'DRAFT'
+37:   | 'PLANNING'
+38:   | 'SUBMITTED'
+39:   | 'CONTRACTOR_SELECTED'
+40:   | 'IN_PROGRESS'
+41:   | 'COMPLETED'
+42:   | 'CANCELLED';
+43: 
+44: /** A project as the application consumes it (DB row + derived location). */
+45: export interface Project {
+46:   id: string; // UUID — public.projects.id
+47:   customer_id: string; // UUID — the authenticated owner (profiles.id)
+48:   contractor_id: string | null;
+49:   selected_at?: string | null;
+50:   name: string;
+51:   project_type: ProjectType | string;
+52:   building_type: string | null;
+53:   full_address: string | null; // Phase 1: full location/address if provided
+54:   location: string | null; // derived client-side: `${city}, ${state}`
+55:   city: string | null;
+56:   state: string | null;
+57:   plot_size: number | null; // sq ft
+58:   built_up_area: number | null; // sq ft
+59:   floors: number | null;
+60:   bedrooms: number | null;
+61:   bathrooms: number | null;
+62:   preferred_materials: string | null; // Phase 1: customer material preferences
+63:   budget: number | null; // INR — legacy live column
+64:   budget_min: number | null; // INR — Phase-4 column (after migration)
+65:   budget_max: number | null; // INR — Phase-4 column (after migration)
+66:   construction_stage: string | null;
+67:   description: string | null;
+68:   requirements: string | null;
+69:   soil_type: string | null;
+70:   priority: string | null;
+71:   design_style: string | null; // design preference (existing UI "Design Style")
+72:   timeline: string | null; // expected completion date (UI "Expected Completion")
+73:   status: ProjectStatus | string;
+74:   /** Phase 6: build completion percentage 0–100 (contractor-managed). */
+75:   progress: number | null;
+76:   /** Phase 6: when on-site work started (contractor-managed). */
+77:   start_date: string | null;
+78:   created_at: string; // ISO timestamp
+79:   updated_at: string; // ISO timestamp
+80: }
+81: 
+82: /**
+83:  * Payload collected by the existing CreateProject form. `customer_id` is NOT
+84:  * included — createProject() injects it from the authenticated session, so the
+85:  * customer's ID can never come from the form (RLS ownership requirement).
+86:  */
+87: export interface CreateProjectData {
+88:   name: string;
+89:   project_type?: ProjectType;
+90:   building_type?: string;
+91:   full_address?: string | null; // Phase 1: full location/address if provided
+92:   city: string;
+93:   state: string;
+94:   plot_size?: number | null;
+95:   built_up_area?: number | null;
+96:   floors?: number | null;
+97:   bedrooms?: number | null;
+98:   bathrooms?: number | null;
+99:   preferred_materials?: string | null; // Phase 1: customer material preferences
+100:   budget?: number | null; // legacy single-budget column
+101:   budget_min?: number | null;
+102:   budget_max?: number | null;
+103:   construction_stage?: string;
+104:   description?: string | null;
+105:   requirements?: string | null;
+106:   soil_type?: string | null;
+107:   priority?: string | null;
+108:   design_style?: string | null;
+109:   timeline?: string | null;
+110:   contractor_id?: string | null;
+111:   status?: ProjectStatus;
+112: }
+113: 
+114: /**
+115:  * Phase 6 — a contractor-posted update on a project (progress / milestone /
+116:  * site / image). Mirrors the public.project_updates table created by
+117:  * supabase/migrations/20260908120000_phase6_contractor_dashboard.sql.
+118:  */
+119: export type ProjectUpdateType = 'PROGRESS' | 'MILESTONE' | 'SITE' | 'IMAGE';
+120: 
+121: export interface ProjectUpdate {
+122:   id: string; // UUID — public.project_updates.id
+123:   project_id: string; // references projects.id
+124:   author_id: string; // profiles.id of the contractor who posted
+125:   update_type: ProjectUpdateType | string;
+126:   title: string | null;
+127:   content: string | null;
+128:   image_url: string | null;
+129:   created_at: string; // ISO timestamp
+130:   updated_at: string; // ISO timestamp
+131: }
+132: 
+133: /** Payload for posting a new contractor update. */
+134: export interface CreateProjectUpdateData {
+135:   project_id: string;
+136:   update_type: ProjectUpdateType;
+137:   title?: string | null;
+138:   content?: string | null;
+139:   image_url?: string | null;
+140: }
+141: 
+142: /**
+143:  * Phase 8 — a construction progress photo uploaded by the contractor.
+144:  * Mirrors the public.construction_photos table created by
+145:  * supabase/migrations/20260908160000_phase8_construction_photo_updates.sql.
+146:  */
+147: export interface ConstructionPhoto {
+148:   id: string; // UUID — public.construction_photos.id
+149:   project_id: string; // references projects.id
+150:   contractor_id: string; // profiles.id of the uploading contractor
+151:   image_url: string; // public URL from storage bucket "construction-updates"
+152:   caption: string | null;
+153:   milestone_id: string | null; // optional link to a project_milestones row
+154:   created_at: string; // ISO timestamp
+155: }
+156: 
+157: /** Payload for uploading a new construction photo. */
+158: export interface CreateConstructionPhotoData {
+159:   project_id: string;
+160:   image_url: string;
+161:   caption?: string | null;
+162:   milestone_id?: string | null;
+163: }
+164: 
+165: /**
+166:  * Phase 11 — a budget allocation line for a project.
+167:  * Mirrors public.budget_items (estimated construction cost breakdown).
+168:  * The original project.budget column is NEVER written by this table.
+169:  */
+170: export interface BudgetItem {
+171:   id: string; // UUID — public.budget_items.id
+172:   project_id: string; // references projects.id
+173:   name: string; // e.g. "Foundation", "Material Cost"
+174:   category: string;
+175:   estimated: number; // in Lakhs (INR)
+176:   spent: number; // in Lakhs (INR)
+177:   sort_order: number;
+178:   created_at: string; // ISO timestamp
+179:   updated_at: string; // ISO timestamp
+180: }
+181: 
+182: /** Payload for creating a budget item. */
+183: export interface CreateBudgetItemData {
+184:   project_id: string;
+185:   name: string;
+186:   category?: string;
+187:   estimated?: number;
+188:   spent?: number;
+189:   sort_order?: number;
+190: }
+191: 
+192: /** Payload for updating a budget item. */
+193: export interface UpdateBudgetItemData {
+194:   name?: string;
+195:   category?: string;
+196:   estimated?: number;
+197:   spent?: number;
+198:   sort_order?: number;
+199: }
+200: 
+201: /**
+202:  * Phase 11 — a construction material take-off line for a project.
+203:  * Mirrors public.construction_materials.
+204:  */
+205: export interface ConstructionMaterial {
+206:   id: string; // UUID — public.construction_materials.id
+207:   project_id: string; // references projects.id
+208:   name: string;
+209:   category: string; // structural | finishing | services
+210:   quantity: number;
+211:   unit: string; // e.g. "kg", "nos", "sqft"
+212:   estimated_cost: number; // in INR
+213:   actual_cost: number; // in INR
+214:   supplier: string | null;
+215:   recommendation?: string | null; // AI purchase optimizer tip (optional)
+216:   sort_order: number;
+217:   created_at: string; // ISO timestamp
+218:   updated_at: string; // ISO timestamp
+219: }
+220: 
+221: /** Payload for creating a construction material. */
+222: export interface CreateConstructionMaterialData {
+223:   project_id: string;
+224:   name: string;
+225:   category?: string;
+226:   quantity?: number;
+227:   unit?: string;
+228:   estimated_cost?: number;
+229:   actual_cost?: number;
+230:   supplier?: string | null;
+231:   sort_order?: number;
+232: }
+233: 
+234: /** Payload for updating a construction material. */
+235: export interface UpdateConstructionMaterialData {
+236:   name?: string;
+237:   category?: string;
+238:   quantity?: number;
+239:   unit?: string;
+240:   estimated_cost?: number;
+241:   actual_cost?: number;
+242:   supplier?: string | null;
+243:   sort_order?: number;
+244: }
+245: 
+246: /** Fields the contractor may update on an existing project. */
+247: export type UpdateProjectData = Partial<
+248:   Pick<
+249:     CreateProjectData,
+250:     | 'name'
+251:     | 'project_type'
+252:     | 'building_type'
+253:     | 'full_address'
+254:     | 'city'
+255:     | 'state'
+256:     | 'plot_size'
+257:     | 'built_up_area'
+258:     | 'floors'
+259:     | 'bedrooms'
+260:     | 'bathrooms'
+261:     | 'preferred_materials'
+262:     | 'budget'
+263:     | 'budget_min'
+264:     | 'budget_max'
+265:     | 'construction_stage'
+266:     | 'description'
+267:     | 'requirements'
+268:     | 'soil_type'
+269:     | 'priority'
+270:     | 'design_style'
+271:     | 'timeline'
+272:     | 'status'
+273:   >
+274: >;

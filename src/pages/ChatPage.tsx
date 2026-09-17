@@ -1,40 +1,236 @@
-import React, { useState } from 'react';
-import { motion } from 'framer-motion';
-import { 
-  Send, Phone, Video, MoreVertical, Image as ImageIcon, 
-  FileText, Mic, Paperclip, CheckCheck, FileDown, Sparkles 
+import React, { useEffect, useState } from 'react';
+import {
+  Send, Phone, Video, MoreVertical, Image as ImageIcon,
+  FileText, Mic, Paperclip, CheckCheck, FileDown,
 } from 'lucide-react';
-import { Message, INITIAL_CHAT } from '../mockData';
+import { supabase } from '../lib/supabase';
+import { Message } from '../mockData';
 import { AiInsight } from '../components/AiInsight';
+import { useAuth } from '../context/AuthContext';
+import {
+  getMessagesByProject,
+  sendMessage,
+  markProjectMessagesRead,
+  subscribeToProjectMessages,
+} from '../services/messageService';
+import { getProjectsByCustomer } from '../services/projectService';
+import type { Message as DbMessage } from '../types';
+import type { Project } from '../types/project';
+import { AIChatbot } from '../components/AIChatbot';
 
-export const ChatPage: React.FC = () => {
-  const [messages, setMessages] = useState<Message[]>(INITIAL_CHAT);
+interface ChatPageProps {
+  /** The REAL project UUID whose chat thread should be shown (from App state). */
+  projectId?: string | null;
+}
+
+/**
+ * Map a live `messages` row onto the chat view-model the existing UI renders.
+ * The live table has NO attachment_type/attachment_name columns (verified
+ * 2026-09-07), so an attachment filename is derived from its URL and the
+ * existing PDF-style attachment block is reused. Rows without an attachment
+ * render as plain messages.
+ */
+function dbRowToChatMessage(row: DbMessage, currentUserId?: string): Message {
+  let attachment: Message['attachment'] = undefined;
+  if (row.attachment_url) {
+    const fileName =
+      decodeURIComponent(row.attachment_url.split('/').pop() ?? '').split('?')[0] ||
+      'Attachment';
+    attachment = { type: 'pdf', name: fileName, url: row.attachment_url };
+  }
+  return {
+    id: row.id,
+    sender:
+      currentUserId && row.sender_id === currentUserId ? 'user' : 'contractor',
+    text: row.message ?? '',
+    time: new Date(row.created_at).toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+    }),
+    attachment,
+    // Phase 9: read status + sender/receiver metadata
+    read: !!row.read_at,
+    senderId: row.sender_id,
+    createdAt: row.created_at,
+  };
+}
+
+export const ChatPage: React.FC<ChatPageProps> = ({ projectId }) => {
+  const { user } = useAuth();
+  const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState("");
+  // The resolved REAL project this chat belongs to (prop → latest own project).
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(projectId ?? null);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [sending, setSending] = useState<boolean>(false);
+  const [sendError, setSendError] = useState<string | null>(null);
+  const [selectedProject, setSelectedProject] = useState<Project | null>(null);
 
-  const handleSendMessage = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!inputText.trim()) return;
+  // Load the selected project details for AI chatbot context
+  useEffect(() => {
+    if (!activeProjectId) {
+      setSelectedProject(null);
+      return;
+    }
+    void (async () => {
+      try {
+        const { data } = await supabase
+          .from('projects')
+          .select('*')
+          .eq('id', activeProjectId)
+          .maybeSingle();
+        setSelectedProject(data as Project | null);
+      } catch {
+        setSelectedProject(null);
+      }
+    })();
+  }, [activeProjectId]);
 
-    const newMsg: Message = {
-      id: String(messages.length + 1),
-      sender: 'user',
-      text: inputText,
-      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    };
+  // 1) Resolve the chat thread's project: explicit prop first, otherwise the
+  //    customer's most recent real project (same convention as the dashboard).
+  useEffect(() => {
+    let isActive = true;
+    setSendError(null);
+    setLoadError(null);
 
-    setMessages([...messages, newMsg]);
-    setInputText("");
-
-    // Simulate contractor replies after 2 seconds
-    setTimeout(() => {
-      const contractorReply: Message = {
-        id: String(messages.length + 2),
-        sender: 'contractor',
-        text: "Got it! I will update the supervisor and send over the updated concreting schedule. Thank you.",
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    if (projectId) {
+      setActiveProjectId(projectId);
+      return () => {
+        isActive = false;
       };
-      setMessages(prev => [...prev, contractorReply]);
-    }, 2000);
+    }
+
+    if (!user) {
+      setActiveProjectId(null);
+      return () => {
+        isActive = false;
+      };
+    }
+
+    getProjectsByCustomer(user.id)
+      .then((projects) => {
+        if (!isActive) return;
+        setActiveProjectId(projects.length > 0 ? projects[0].id : null);
+      })
+      .catch((err) => {
+        if (!isActive) return;
+        console.warn('[ChatPage] could not resolve active project:', err);
+        setActiveProjectId(null);
+      });
+
+    return () => {
+      isActive = false;
+    };
+  }, [projectId, user]);
+
+  // 2) Load the live thread + subscribe to Realtime whenever the resolved
+  //    project changes. Also marks unread messages as read on open.
+  useEffect(() => {
+    let isActive = true;
+    if (!activeProjectId) {
+      setMessages([]);
+      setLoading(false);
+      return () => {
+        isActive = false;
+      };
+    }
+    setLoading(true);
+    setLoadError(null);
+    getMessagesByProject(activeProjectId)
+      .then((rows) => {
+        if (isActive) setMessages(rows.map((row) => dbRowToChatMessage(row, user?.id)));
+      })
+      .catch((err) => {
+        if (!isActive) return;
+        // Never crash the page — show the message inline and keep the UI usable.
+        console.warn('[ChatPage] message load failed:', err);
+        setMessages([]);
+        setLoadError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (isActive) setLoading(false);
+      });
+
+    // Mark all messages in this project as read for the current user.
+    if (user) {
+      void markProjectMessagesRead(activeProjectId).catch(() => {});
+    }
+
+    // Subscribe to Realtime for live updates (INSERT / UPDATE / DELETE).
+    const unsubscribe = subscribeToProjectMessages(
+      activeProjectId,
+      (newMsg) => {
+        if (!isActive) return;
+        setMessages((prev) => {
+          // Avoid duplicates from our own INSERT (already added by handleSendMessage).
+          if (prev.some((m) => m.id === newMsg.id)) return prev;
+          return [...prev, dbRowToChatMessage(newMsg, user?.id)];
+        });
+      },
+      (updatedMsg) => {
+        if (!isActive) return;
+        setMessages((prev) =>
+          prev.map((m) => (m.id === updatedMsg.id ? dbRowToChatMessage(updatedMsg, user?.id) : m))
+        );
+      },
+      (deletedId) => {
+        if (!isActive) return;
+        setMessages((prev) => prev.filter((m) => m.id !== deletedId));
+      }
+    );
+
+    return () => {
+      isActive = false;
+      unsubscribe();
+    };
+  }, [activeProjectId, user]);
+
+  const handleSendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const text = inputText.trim();
+    if (!text || sending || !activeProjectId || !user) return;
+
+    setSending(true);
+    setSendError(null);
+    try {
+      // Resolve the receiver: the other participant in this project.
+      // For a customer, it's the contractor; for a contractor, it's the customer.
+      let receiverId: string | null = null;
+      try {
+        const { data: projectRow } = await supabase
+          .from('projects')
+          .select('customer_id, contractor_id')
+          .eq('id', activeProjectId)
+          .maybeSingle();
+        if (projectRow) {
+          receiverId =
+            projectRow.customer_id === user.id
+              ? projectRow.contractor_id
+              : projectRow.customer_id;
+        }
+      } catch {
+        // If we can't resolve the receiver, send without one (broadcast).
+      }
+
+      // Real persistence into public.messages (project_id, sender_id, message).
+      const row = await sendMessage({
+        project_id: activeProjectId,
+        sender_id: user.id,
+        receiver_id: receiverId,
+        message: text,
+        attachment_url: null,
+      });
+      setMessages((prev) => [...prev, dbRowToChatMessage(row, user.id)]);
+      setInputText("");
+    } catch (err) {
+      // RLS/permission failures land here with a friendly message from the
+      // service. The page stays fully usable and the draft text is kept.
+      console.warn('[ChatPage] sendMessage failed:', err);
+      setSendError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSending(false);
+    }
   };
 
   const triggerUploadMock = (type: string) => {
@@ -123,7 +319,33 @@ export const ChatPage: React.FC = () => {
 
           {/* Chat Messages viewport */}
           <div className="flex-grow p-6 overflow-y-auto space-y-4 bg-warmbeige-50/30">
-            {messages.map(msg => {
+            {loading && (
+              <div className="flex items-center justify-center py-10">
+                <div className="w-8 h-8 rounded-full border-4 border-terracotta/20 border-t-terracotta animate-spin" />
+              </div>
+            )}
+
+            {!loading && loadError && (
+              <div className="p-3 rounded-xl bg-amber-50 border border-amber-100 text-xs font-semibold text-amber-800">
+                {loadError}
+              </div>
+            )}
+
+            {!loading && !loadError && messages.length === 0 && (
+              <div className="flex flex-col items-center justify-center text-center py-10">
+                <div className="w-12 h-12 rounded-2xl bg-white border border-neutral-200 flex items-center justify-center mb-3">
+                  <Send className="w-5 h-5 text-terracotta" />
+                </div>
+                <p className="text-sm font-bold text-neutral-700">No messages yet</p>
+                <p className="text-xs text-neutral-400 mt-1 max-w-xs">
+                  {activeProjectId
+                    ? 'Start the conversation — messages are stored securely with this project.'
+                    : 'Create a project first — your secure contractor chat opens once a project exists.'}
+                </p>
+              </div>
+            )}
+
+            {!loading && !loadError && messages.map(msg => {
               const isMe = msg.sender === 'user';
               return (
                 <div key={msg.id} className={`flex items-end gap-2.5 ${isMe ? "justify-end" : "justify-start"}`}>
@@ -165,13 +387,28 @@ export const ChatPage: React.FC = () => {
                     
                     <div className="flex items-center justify-end gap-1 px-1">
                       <span className="text-[9px] text-neutral-400 font-medium">{msg.time}</span>
-                      {isMe && <CheckCheck className="w-3.5 h-3.5 text-emerald-500" />}
+                      {isMe && msg.read ? (
+                        <span title="Read">
+                          <CheckCheck className="w-3.5 h-3.5 text-emerald-500" />
+                        </span>
+                      ) : isMe && !msg.read ? (
+                        <span title="Unread">
+                          <CheckCheck className="w-3.5 h-3.5 text-neutral-300" />
+                        </span>
+                      ) : null}
                     </div>
                   </div>
                 </div>
               );
             })}
           </div>
+
+          {/* Send failure notice — non-blocking, the thread stays usable */}
+          {sendError && (
+            <div className="mx-4 mb-1 p-3 rounded-xl bg-red-50 border border-red-100 text-xs font-semibold text-red-700">
+              {sendError}
+            </div>
+          )}
 
           {/* Chat Message Input */}
           <form onSubmit={handleSendMessage} className="p-4 bg-white border-t border-neutral-100 flex items-center gap-3">
@@ -227,6 +464,9 @@ export const ChatPage: React.FC = () => {
         confidenceScore={98}
         impactValue="Pricing Verified Safe"
       />
+
+      {/* Phase 12: AI Chatbot assistant */}
+      <AIChatbot project={selectedProject} />
     </div>
   );
 };

@@ -1,0 +1,14 @@
+const fs = require('fs');
+const t = fs.readFileSync('src/pages/CustomerDashboard.tsx', 'utf8');
+const lines = t.split('\n');
+const open = (t.match(/<PremiumCard[ >]/g) || []).length;
+const close = (t.match(/<\/PremiumCard>/g) || []).length;
+console.log('PremiumCard open=' + open + ' close=' + close);
+const gm = t.match(/grid lg:grid-cols-\d[^\n"]*/);
+console.log('GRID: ' + (gm && gm[0]));
+console.log('COLSPANS: ' + (t.match(/lg:col-span-\d/g) || []).join(','));
+console.log('QuickActionCard uses: ' + (t.match(/<QuickActionCard/g) || []).length);
+console.log('--- lines 338-344 ---');
+for (let i = 337; i < 344; i++) console.log((i + 1) + ': ' + lines[i]);
+console.log('--- lines 692-712 ---');
+for (let i = 691; i < 712; i++) console.log((i + 1) + ': ' + lines[i]);

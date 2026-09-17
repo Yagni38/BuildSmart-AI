@@ -1,5 +1,6 @@
 // Mock Database for BuildSmart AI Platform
-
+// NOTE: This Contractor interface is for mock data only.
+// For database operations, use the Contractor type from ./types.
 export interface Contractor {
   id: string;
   company: string;
@@ -60,6 +61,12 @@ export interface Message {
     name: string;
     url?: string;
   };
+  /** Phase 9: read status (true once the receiver has read the message). */
+  read?: boolean;
+  /** Phase 9: sender's profile ID (for read-status logic). */
+  senderId?: string;
+  /** Phase 9: ISO timestamp of when the message was created. */
+  createdAt?: string;
 }
 
 export const INITIAL_CONTRACTORS: Contractor[] = [
