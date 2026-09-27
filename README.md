@@ -77,6 +77,23 @@ The application uses:
 - Git
 - GitHub
 
+### 🏆 Achievement
+
+SparkTank 4.0 – Top 10 Finalist
+BuildSmart AI – Home Vision was selected among multiple participating teams and advanced through the competition to reach the Top 10 Finals of SparkTank 4.0.
+This achievement reflects our team's work in developing and presenting a practical technology solution for improving residential construction management.
+🌐 Live Demo
+https://build-smart-ai-eta.vercel.app/
+
+📌 Future Development
+
+Planned improvements include:
+1.Advanced AI-based contractor recommendation
+2.AI-assisted construction cost estimation
+3.Cost-overrun and delay prediction
+4.Online payments and milestone payments
+5.Advanced analytics and reporting
+
 ## 🏗️ Project Workflow
 
 ```text
@@ -101,23 +118,6 @@ Progress & Material Monitoring
 Budget & Expense Tracking
         ↓
 Customer & Admin Monitoring
-
-🏆 Achievement
-
-SparkTank 4.0 – Top 10 Finalist
-BuildSmart AI – Home Vision was selected among multiple participating teams and advanced through the competition to reach the Top 10 Finals of SparkTank 4.0.
-This achievement reflects our team's work in developing and presenting a practical technology solution for improving residential construction management.
-🌐 Live Demo
-https://build-smart-ai-eta.vercel.app/
-
-📌 Future Development
-
-Planned improvements include:
-1.Advanced AI-based contractor recommendation
-2.AI-assisted construction cost estimation
-3.Cost-overrun and delay prediction
-4.Online payments and milestone payments
-5.Advanced analytics and reporting
 
 👥 Team
 Team Home Vision
